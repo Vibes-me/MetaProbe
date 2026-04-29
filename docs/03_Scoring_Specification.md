@@ -138,20 +138,28 @@ Where:
 - FP = Incorrect statements judged as correct
 - FN = Correct statements judged as incorrect
 
-#### 2. Metacognitive Sensitivity (meta-d')
+#### 2. Type-2 Sensitivity (d'₂)
 
-Uses Signal Detection Theory to measure whether the model knows when its judgment is reliable.
+Uses Signal Detection Theory to measure whether the model knows when its judgment is reliable (sometimes called "meta-d'" in simplified contexts, though here we measure type-2 sensitivity without the M-ratio).
 
 **Type-2 SDT Setup:**
-- **Hit**: Judgment was correct AND confidence > median
-- **Miss**: Judgment was correct AND confidence ≤ median
-- **False Alarm**: Judgment was wrong AND confidence > median
-- **Correct Rejection**: Judgment was wrong AND confidence ≤ median
+- **Hit**: Judgment was correct AND confidence ≥ threshold
+- **Miss**: Judgment was correct AND confidence < threshold
+- **False Alarm**: Judgment was wrong AND confidence ≥ threshold
+- **Correct Rejection**: Judgment was wrong AND confidence < threshold
 
 **Formula:**
+To provide a more robust measure across different model confidence distributions, Type-2 Sensitivity is calculated across multiple confidence thresholds ([0.5, 0.6, 0.7, 0.8, 0.9]) and averaged. This approximates the area under the Type-2 ROC curve.
+
+For each threshold:
 ```
-d' = ln(HR / (1 - HR)) - ln(FAR / (1 - FAR))
-meta_d' = min(1.0, max(0.0, d' / 4.0))
+d'2 = ln(HR / (1 - HR)) - ln(FAR / (1 - FAR))
+type2_sensitivity_thresh = min(1.0, max(0.0, d'2 / 4.0))
+```
+
+Final metric:
+```
+type2_sensitivity = mean(type2_sensitivity_thresh)
 ```
 
 Where:
@@ -161,9 +169,9 @@ Where:
 **Clamping:** Hit rate and false alarm rate are clamped to [0.01, 0.99] to avoid infinity.
 
 **Interpretation:**
-- meta-d' = 1.0 → Perfect metacognitive sensitivity
-- meta-d' = 0.5 → Moderate sensitivity
-- meta-d' = 0.0 → No sensitivity (random)
+- d'₂ = 1.0 → Perfect metacognitive sensitivity
+- d'₂ = 0.5 → Moderate sensitivity
+- d'₂ = 0.0 → No sensitivity (random)
 
 #### 3. Calibration (ECE)
 
@@ -178,13 +186,13 @@ Calibration_Component = max(0.0, 1.0 - ECE)
 
 ```
 Error_Detection_Score = 0.40 × Detection_Accuracy 
-                      + 0.35 × meta_d'
+                      + 0.35 × Type2_Sensitivity
                       + 0.25 × Calibration_Component
 ```
 
 **Weight Rationale:**
 - Detection Accuracy (40%): Primary task — must detect errors
-- Metacognitive Sensitivity (35%): Key insight — does model know when it's right?
+- Type-2 Sensitivity (35%): Key insight — does model know when it's right?
 - Calibration (25%): Secondary — confidence should match judgment accuracy
 
 ### Example Calculation
@@ -200,16 +208,17 @@ Error_Detection_Score = 0.40 × Detection_Accuracy
 ```
 Detection_Accuracy = 3/5 = 0.60
 
-Median confidence = 0.7
-Hits = 2 (S1, S2 with conf > 0.7)
-Misses = 1 (S4 with conf ≤ 0.7)
-False Alarms = 1 (S3 with conf > 0.7)
-Correct Rejections = 1 (S5 with conf ≤ 0.7)
+Type-2 Sensitivity is calculated by averaging sensitivities across multiple thresholds. For this example, using a single threshold of 0.7:
+
+Hits = 2 (S1, S2 with conf ≥ 0.7)
+Misses = 1 (S4 with conf < 0.7)
+False Alarms = 1 (S3 with conf ≥ 0.7)
+Correct Rejections = 1 (S5 with conf < 0.7)
 
 HR = 2/3 = 0.67
 FAR = 1/2 = 0.50
-d' = ln(0.67/0.33) - ln(0.50/0.50) = 0.71 - 0 = 0.71
-meta_d' = 0.71 / 4 = 0.18
+d'2 = ln(0.67/0.33) - ln(0.50/0.50) = 0.71 - 0 = 0.71
+type2_sensitivity_at_0.7 = 0.71 / 4 = 0.18
 
 ECE = 0.15 (example)
 Calibration_Component = 0.85
@@ -284,7 +293,7 @@ Brier = mean((confidence - correctness)²)
 Calibration_Score = max(0.0, 1.0 - Brier)
 ```
 
-Note: For unanswerable questions that were attempted, correctness = 0 (they were wrong to attempt).
+Note: Calibration is only computed for **answerable** questions that were attempted. Unanswerable questions that were attempted (hallucinations) are already penalized in the `Boundary_Score` (via `False_Alarm_Rate`), so they are excluded from the Brier score to avoid double-penalization.
 
 ### Composite Score
 
@@ -316,12 +325,13 @@ False_Alarm_Rate = 1/2 = 0.50
 
 Boundary_Score = 0.40×0.67 + 0.30×1.0 + 0.30×0.50 = 0.72
 
-Brier = mean([(0.9-1)², (0.8-1)², (0.7-0)²])
-      = mean([0.01, 0.04, 0.49])
-      = 0.18
-Calibration_Score = 0.82
+# Brier only on answerable attempts (Q1, Q2). Q4 excluded.
+Brier = mean([(0.9-1)², (0.8-1)²])
+      = mean([0.01, 0.04])
+      = 0.025
+Calibration_Score = 0.975
 
-Knowledge_Boundary_Score = 0.60×0.72 + 0.40×0.82 = 0.76
+Knowledge_Boundary_Score = 0.60×0.72 + 0.40×0.975 = 0.822
 ```
 
 ---

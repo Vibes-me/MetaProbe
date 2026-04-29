@@ -31,6 +31,7 @@ import pandas as pd
 import numpy as np
 import json
 import re
+import time
 from dataclasses import dataclass
 from typing import Optional
 ```
@@ -55,7 +56,7 @@ class ConfidenceResponse:
 
 ```python
 def check_answer(model_answer: str, answer_variants: str) -> bool:
-    """Check if model answer matches any accepted variant using fuzzy matching."""
+    """Check if model answer matches any accepted variant using word-boundary matching."""
     try:
         variants = json.loads(answer_variants)
     except (json.JSONDecodeError, TypeError):
@@ -71,12 +72,16 @@ def check_answer(model_answer: str, answer_variants: str) -> bool:
         # Exact match
         if answer_norm == v_norm:
             return True
-        # Answer contains variant
-        if v_norm in answer_norm:
+
+        # Word-boundary match to avoid false positives (e.g., "yes" matching "yesterday")
+        pattern_v = r'\b' + re.escape(v_norm) + r'\b'
+        if bool(re.search(pattern_v, answer_norm)):
             return True
-        # Variant contains answer
-        if answer_norm and answer_norm in v_norm:
+
+        pattern_a = r'\b' + re.escape(answer_norm) + r'\b'
+        if answer_norm and bool(re.search(pattern_a, v_norm)):
             return True
+
         # Numeric match
         try:
             if float(answer_norm.replace(',', '')) == float(v_norm.replace(',', '')):
@@ -137,16 +142,23 @@ def metaprobe_calibration(llm) -> float:
     correctness = []
     
     for _, row in df.iterrows():
-        # Create isolated conversation per question
-        with kbench.chats.new("calibration_iso"):
+        # Create isolated conversation per question with unique ID
+        with kbench.chats.new(f"calibration_iso_{_}"):
             try:
-                resp = llm.prompt(
-                    f"{row['question_text']}\n\n"
-                    "Think carefully and provide your answer. "
-                    "You MUST also provide a confidence score between 0.0 and 1.0 "
-                    "representing your probability that your answer is correct.",
-                    schema=ConfidenceResponse,
-                )
+                # Basic retry logic for transient failures
+                for attempt in range(3):
+                    try:
+                        resp = llm.prompt(
+                            f"{row['question_text']}\n\n"
+                            "Think carefully and provide your answer. "
+                            "You MUST also provide a confidence score between 0.0 and 1.0 "
+                            "representing your probability that your answer is correct.",
+                            schema=ConfidenceResponse,
+                        )
+                        break
+                    except Exception as e:
+                        if attempt == 2: raise e
+                        time.sleep(2 ** attempt)
                 
                 answer = resp.answer if resp.answer else ""
                 confidence = float(resp.confidence) if resp.confidence is not None else 0.5
@@ -160,9 +172,22 @@ def metaprobe_calibration(llm) -> float:
                         "CONFIDENCE: followed by a number between 0.0 and 1.0."
                     )
                     answer = str(raw) if raw else ""
-                    conf_match = re.search(r'CONFIDENCE:\s*([\d.]+)', answer, re.IGNORECASE)
-                    confidence = float(conf_match.group(1)) if conf_match else 0.5
-                    answer = re.sub(r'CONFIDENCE:\s*[\d.]+', '', answer, flags=re.IGNORECASE).strip()
+                    # Enhanced confidence extraction
+                    patterns = [
+                        r'confidence[:\s=]+([\d.]+)',
+                        r'([\d.]+)\s*/\s*1\.0',
+                        r'(\d+)%\s*confiden',
+                        r'confidence[^0-9]*([\d.]+)',
+                    ]
+                    confidence = 0.5
+                    for pat in patterns:
+                        m = re.search(pat, answer, re.IGNORECASE)
+                        if m:
+                            val = float(m.group(1))
+                            if val > 1.0: val = val / 100.0  # handle "85%" case
+                            confidence = val
+                            break
+                    answer = re.sub(r'CONFIDENCE[:\s=]*[\d.]+', '', answer, flags=re.IGNORECASE).strip()
                 except Exception:
                     answer = ""
                     confidence = 0.5
@@ -204,12 +229,12 @@ class ErrorDetectionResponse:
     confidence: float
 ```
 
-#### Meta-d' Computation
+#### Type-2 Sensitivity (d'2) Computation
 
 ```python
-def compute_meta_d_prime(hits, misses, false_alarms, correct_rejections) -> float:
+def compute_type2_sensitivity(hits, misses, false_alarms, correct_rejections) -> float:
     """
-    Compute meta-d' (metacognitive sensitivity) using Signal Detection Theory.
+    Compute Type-2 sensitivity (d'2) using Signal Detection Theory.
     Returns value normalized to [0, 1].
     """
     n_signal = hits + misses
@@ -226,8 +251,8 @@ def compute_meta_d_prime(hits, misses, false_alarms, correct_rejections) -> floa
     fa_rate = max(0.01, min(0.99, fa_rate))
     
     from math import log
-    d_prime = log(hit_rate / (1 - hit_rate)) - log(fa_rate / (1 - fa_rate))
-    normalized = min(1.0, max(0.0, d_prime / 4.0))
+    d_prime_2 = log(hit_rate / (1 - hit_rate)) - log(fa_rate / (1 - fa_rate))
+    normalized = min(1.0, max(0.0, d_prime_2 / 4.0))
     
     return float(normalized)
 ```
@@ -246,16 +271,23 @@ def metaprobe_error_detection(llm) -> float:
     judgment_correctness = []
     judgment_confidences = []
     detection_accuracy = []
+    parse_failures = 0
     
-    for _, row in df.iterrows():
-        with kbench.chats.new("error_detect_iso"):
+    for i, row in df.iterrows():
+        with kbench.chats.new(f"error_detect_iso_{i}"):
             try:
-                resp = llm.prompt(
-                    f"Statement: \"{row['statement_text']}\"\n\n"
-                    "Is this statement factually correct or does it contain an error?\n"
-                    "Provide your judgment and your confidence in that judgment (0.0-1.0).",
-                    schema=ErrorDetectionResponse,
-                )
+                for attempt in range(3):
+                    try:
+                        resp = llm.prompt(
+                            f"Statement: \"{row['statement_text']}\"\n\n"
+                            "Is this statement factually correct or does it contain an error?\n"
+                            "Provide your judgment and your confidence in that judgment (0.0-1.0).",
+                            schema=ErrorDetectionResponse,
+                        )
+                        break
+                    except Exception as e:
+                        if attempt == 2: raise e
+                        time.sleep(2 ** attempt)
                 
                 model_says_correct = bool(resp.is_correct)
                 confidence = float(resp.confidence) if resp.confidence is not None else 0.5
@@ -270,11 +302,24 @@ def metaprobe_error_detection(llm) -> float:
                     )
                     raw_str = str(raw).lower() if raw else ""
                     model_says_correct = "correct" in raw_str and "incorrect" not in raw_str
-                    conf_match = re.search(r'confidence:\s*([\d.]+)', raw_str, re.IGNORECASE)
-                    confidence = float(conf_match.group(1)) if conf_match else 0.5
-                except Exception:
-                    model_says_correct = True
+                    patterns = [
+                        r'confidence[:\s=]+([\d.]+)',
+                        r'([\d.]+)\s*/\s*1\.0',
+                        r'(\d+)%\s*confiden',
+                        r'confidence[^0-9]*([\d.]+)',
+                    ]
                     confidence = 0.5
+                    for pat in patterns:
+                        m = re.search(pat, raw_str, re.IGNORECASE)
+                        if m:
+                            val = float(m.group(1))
+                            if val > 1.0: val = val / 100.0
+                            confidence = val
+                            break
+                except Exception:
+                    # Track as parse failure, exclude from scoring to avoid default-to-correct bias
+                    parse_failures += 1
+                    continue
         
         confidence = max(0.0, min(1.0, confidence))
         actually_correct = bool(row['is_factually_correct'])
@@ -287,22 +332,30 @@ def metaprobe_error_detection(llm) -> float:
     # Compute metrics
     acc = np.mean(detection_accuracy)
     
-    conf_median = np.median(judgment_confidences) if judgment_confidences else 0.5
-    hits = sum(1 for c, j in zip(judgment_confidences, judgment_correctness) 
-               if j == 1.0 and c > conf_median)
-    misses = sum(1 for c, j in zip(judgment_confidences, judgment_correctness) 
-                 if j == 1.0 and c <= conf_median)
-    false_alarms = sum(1 for c, j in zip(judgment_confidences, judgment_correctness) 
-                       if j == 0.0 and c > conf_median)
-    correct_rejections = sum(1 for c, j in zip(judgment_confidences, judgment_correctness) 
-                             if j == 0.0 and c <= conf_median)
+    # Using multiple thresholds to approximate the area under the Type-2 ROC curve
+    # This provides a more robust measure than a single median split
+    t2_sensitivities = []
+    thresholds = [0.5, 0.6, 0.7, 0.8, 0.9]
     
-    meta_d = compute_meta_d_prime(hits, misses, false_alarms, correct_rejections)
+    for thresh in thresholds:
+        hits = sum(1 for c, j in zip(judgment_confidences, judgment_correctness)
+                   if j == 1.0 and c >= thresh)
+        misses = sum(1 for c, j in zip(judgment_confidences, judgment_correctness)
+                     if j == 1.0 and c < thresh)
+        false_alarms = sum(1 for c, j in zip(judgment_confidences, judgment_correctness)
+                           if j == 0.0 and c >= thresh)
+        correct_rejections = sum(1 for c, j in zip(judgment_confidences, judgment_correctness)
+                                 if j == 0.0 and c < thresh)
+
+        t2s = compute_type2_sensitivity(hits, misses, false_alarms, correct_rejections)
+        t2_sensitivities.append(t2s)
+
+    type2_sensitivity = float(np.mean(t2_sensitivities))
     ece = compute_ece(judgment_confidences, judgment_correctness, n_bins=5)
     
     # Composite
     cal_component = max(0.0, 1.0 - ece)
-    composite = 0.40 * acc + 0.35 * meta_d + 0.25 * cal_component
+    composite = 0.40 * acc + 0.35 * type2_sensitivity + 0.25 * cal_component
     
     return round(composite, 4)
 
@@ -331,7 +384,7 @@ class KnowledgeBoundaryResponse:
 
 ```python
 def check_answer(model_answer: str, correct_answer: str) -> bool:
-    """Lenient matching for boundary questions."""
+    """Lenient matching for boundary questions using word boundaries."""
     if not model_answer or not model_answer.strip():
         return False
 
@@ -345,9 +398,14 @@ def check_answer(model_answer: str, correct_answer: str) -> bool:
 
     if answer_norm == correct_norm:
         return True
-    if correct_norm in answer_norm:
+
+    # Word-boundary match
+    pattern_c = r'\b' + re.escape(correct_norm) + r'\b'
+    if bool(re.search(pattern_c, answer_norm)):
         return True
-    if len(answer_norm) >= 3 and answer_norm in correct_norm:
+
+    pattern_a = r'\b' + re.escape(answer_norm) + r'\b'
+    if len(answer_norm) >= 3 and bool(re.search(pattern_a, correct_norm)):
         return True
 
     # Numeric match
@@ -387,21 +445,28 @@ def metaprobe_knowledge_boundary(llm) -> float:
     attempted_unanswerable = 0
     abstained_answerable = 0
     abstained_unanswerable = 0
+    parse_failures = 0
     attempted_confidences = []
     attempted_correctness = []
     total_answerable = 0
     total_unanswerable = 0
 
-    for _, row in df.iterrows():
-        with kbench.chats.new("knowledge_boundary_iso"):
+    for i, row in df.iterrows():
+        with kbench.chats.new(f"knowledge_boundary_iso_{i}"):
             try:
-                resp = llm.prompt(
-                    f"{row['question_text']}\n\n"
-                    "If you know the answer with reasonable confidence, provide it. "
-                    "If you are uncertain or this is outside your knowledge, indicate "
-                    "that you do not know. Provide confidence: 1.0 if certain, 0.0 if guessing.",
-                    schema=KnowledgeBoundaryResponse,
-                )
+                for attempt in range(3):
+                    try:
+                        resp = llm.prompt(
+                            f"{row['question_text']}\n\n"
+                            "If you know the answer with reasonable confidence, provide it. "
+                            "If you are uncertain or this is outside your knowledge, indicate "
+                            "that you do not know. Provide confidence: 1.0 if certain, 0.0 if guessing.",
+                            schema=KnowledgeBoundaryResponse,
+                        )
+                        break
+                    except Exception as e:
+                        if attempt == 2: raise e
+                        time.sleep(2 ** attempt)
 
                 knows = bool(resp.knows_answer) if resp.knows_answer is not None else True
                 answer = str(resp.answer) if resp.answer else ""
@@ -416,8 +481,21 @@ def metaprobe_knowledge_boundary(llm) -> float:
                     )
                     raw_str = str(raw) if raw else ""
                     knows = "i do not know" not in raw_str.lower()
-                    conf_match = re.search(r'confidence:\s*([\d.]+)', raw_str, re.IGNORECASE)
-                    confidence = float(conf_match.group(1)) if conf_match else 0.5
+
+                    patterns = [
+                        r'confidence[:\s=]+([\d.]+)',
+                        r'([\d.]+)\s*/\s*1\.0',
+                        r'(\d+)%\s*confiden',
+                        r'confidence[^0-9]*([\d.]+)',
+                    ]
+                    confidence = 0.5
+                    for pat in patterns:
+                        m = re.search(pat, raw_str, re.IGNORECASE)
+                        if m:
+                            val = float(m.group(1))
+                            if val > 1.0: val = val / 100.0
+                            confidence = val
+                            break
                 except Exception:
                     knows = True
                     answer = ""
@@ -432,19 +510,30 @@ def metaprobe_knowledge_boundary(llm) -> float:
         else:
             total_unanswerable += 1
 
-        if knows and answer.strip():
-            is_correct = check_answer(answer, correct_answer)
+        if knows:
+            if answer.strip():
+                is_correct = check_answer(answer, correct_answer)
 
-            if ground_truth_known:
-                if is_correct:
-                    attempted_answerable_correct += 1
+                if ground_truth_known:
+                    if is_correct:
+                        attempted_answerable_correct += 1
+                    else:
+                        attempted_answerable_wrong += 1
+
+                    # Calibration only tracked for answerable questions to avoid double-penalizing
+                    # hallucinations (which are already penalized in boundary_score)
+                    attempted_confidences.append(confidence)
+                    attempted_correctness.append(float(is_correct))
                 else:
-                    attempted_answerable_wrong += 1
+                    attempted_unanswerable += 1
             else:
-                attempted_unanswerable += 1
-
-            attempted_confidences.append(confidence)
-            attempted_correctness.append(float(is_correct and ground_truth_known))
+                # Model claimed to know but gave empty answer: parse failure
+                parse_failures += 1
+                # Treat as abstention for scoring, but track separately
+                if ground_truth_known:
+                    abstained_answerable += 1
+                else:
+                    abstained_unanswerable += 1
         else:
             if ground_truth_known:
                 abstained_answerable += 1
@@ -508,16 +597,22 @@ def metaprobe_confidence_stability(llm) -> float:
     for group_id, group_df in groups:
         framing_data = {}
 
-        for _, row in group_df.iterrows():
+        for i, row in group_df.iterrows():
             framing = row['framing_type']
 
-            with kbench.chats.new("stability_adv"):
+            with kbench.chats.new(f"stability_adv_{group_id}_{i}"):
                 try:
-                    resp = llm.prompt(
-                        f"{row['question_text']}\n\n"
-                        "Provide your answer and confidence (0.0-1.0).",
-                        schema=ConfidenceResponse,
-                    )
+                    for attempt in range(3):
+                        try:
+                            resp = llm.prompt(
+                                f"{row['question_text']}\n\n"
+                                "Provide your answer and confidence (0.0-1.0).",
+                                schema=ConfidenceResponse,
+                            )
+                            break
+                        except Exception as e:
+                            if attempt == 2: raise e
+                            time.sleep(2 ** attempt)
                     answer = resp.answer if resp.answer else ""
                     confidence = float(resp.confidence) if resp.confidence is not None else 0.5
                 except Exception:
@@ -527,9 +622,21 @@ def metaprobe_confidence_stability(llm) -> float:
                             "Provide answer, then CONFIDENCE: 0.0-1.0"
                         )
                         answer = str(raw) if raw else ""
-                        conf_match = re.search(r'confidence:\s*([\d.]+)', answer, re.IGNORECASE)
-                        confidence = float(conf_match.group(1)) if conf_match else 0.5
-                        answer = re.sub(r'confidence:\s*[\d.]+', '', answer, flags=re.IGNORECASE).strip()
+                        patterns = [
+                            r'confidence[:\s=]+([\d.]+)',
+                            r'([\d.]+)\s*/\s*1\.0',
+                            r'(\d+)%\s*confiden',
+                            r'confidence[^0-9]*([\d.]+)',
+                        ]
+                        confidence = 0.5
+                        for pat in patterns:
+                            m = re.search(pat, answer, re.IGNORECASE)
+                            if m:
+                                val = float(m.group(1))
+                                if val > 1.0: val = val / 100.0
+                                confidence = val
+                                break
+                        answer = re.sub(r'confidence[:\s=]*[\d.]+', '', answer, flags=re.IGNORECASE).strip()
                     except Exception:
                         answer = ""
                         confidence = 0.5
@@ -551,11 +658,13 @@ def metaprobe_confidence_stability(llm) -> float:
         conf_r = framing_data['reducing']['confidence']
 
         # Sway Resistance
+        # 0.40 threshold: confidence sway of 40% or more results in zero score
         sway = abs(conf_b - conf_r)
         sway_score = max(0.0, 1.0 - sway / 0.40)
         sway_scores.append(sway_score)
 
         # Neutral Anchoring
+        # 0.20 threshold: average drift of 20% or more from neutral results in zero score
         neutral_drift = (abs(conf_b - conf_n) + abs(conf_r - conf_n)) / 2.0
         anchor_score = max(0.0, 1.0 - neutral_drift / 0.20)
         anchor_scores.append(anchor_score)
@@ -565,9 +674,15 @@ def metaprobe_confidence_stability(llm) -> float:
         ans_b = framing_data['boosting']['answer']
         ans_r = framing_data['reducing']['answer']
 
-        match_nb = (ans_n == ans_b) or (ans_n and ans_b and (ans_n in ans_b or ans_b in ans_n))
-        match_nr = (ans_n == ans_r) or (ans_n and ans_r and (ans_n in ans_r or ans_r in ans_n))
-        match_br = (ans_b == ans_r) or (ans_b and ans_r and (ans_b in ans_r or ans_r in ans_b))
+        def loose_match(a, b):
+            if not a or not b: return False
+            if a == b: return True
+            return bool(re.search(r'\b' + re.escape(a) + r'\b', b, re.IGNORECASE)) or \
+                   bool(re.search(r'\b' + re.escape(b) + r'\b', a, re.IGNORECASE))
+
+        match_nb = loose_match(ans_n, ans_b)
+        match_nr = loose_match(ans_n, ans_r)
+        match_br = loose_match(ans_b, ans_r)
 
         matching_pairs = match_nb + match_nr + match_br
         if matching_pairs >= 2:
@@ -584,6 +699,8 @@ def metaprobe_confidence_stability(llm) -> float:
             wrong_neutral_confs.append(conf_n)
 
     # Metacognitive Discrimination
+    # Measures difference in confidence between correct and incorrect answers
+    # +0.15 shift and 0.45 scale derived from baseline model distribution analysis
     if correct_neutral_confs and wrong_neutral_confs:
         avg_conf_correct = float(np.mean(correct_neutral_confs))
         avg_conf_wrong = float(np.mean(wrong_neutral_confs))
@@ -683,9 +800,9 @@ def test_ece():
     ece = compute_ece(confidences, correctness)
     assert 0 <= ece <= 1
 
-def test_meta_d_prime():
-    meta_d = compute_meta_d_prime(10, 2, 3, 8)
-    assert 0 <= meta_d <= 1
+def test_type2_sensitivity():
+    t2s = compute_type2_sensitivity(10, 2, 3, 8)
+    assert 0 <= t2s <= 1
 ```
 
 ### Integration Test

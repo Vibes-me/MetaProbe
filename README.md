@@ -66,7 +66,7 @@ Can the model spot when a statement is wrong?
 
 - **29 statements** (15 correct, 14 incorrect)
 - **Balanced design** to prevent bias
-- **Metrics:** Detection accuracy + Metacognitive sensitivity (meta-d') + Calibration
+- **Metrics:** Detection accuracy + Type-2 Sensitivity (d'₂) + Calibration
 
 **Example:**
 ```
